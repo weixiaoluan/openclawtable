@@ -1,0 +1,6 @@
+panel/.generated/
+panel/__pycache__/
+.tools/ps2exe/*.zip
+.tools/ps2exe/*.nupkg
+*.pyc
+Thumbs.db
