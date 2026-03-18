@@ -230,6 +230,48 @@ function Get-OpenClawNodeExePath {
   throw "Unable to resolve node.exe from PATH."
 }
 
+function Get-OpenClawNoProxyValue {
+  $entries = [System.Collections.Generic.List[string]]::new()
+  $seen = @{}
+
+  foreach ($raw in @($env:NO_PROXY, $env:no_proxy)) {
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+      continue
+    }
+
+    foreach ($part in ($raw -split ',')) {
+      $candidate = $part.Trim()
+      if ([string]::IsNullOrWhiteSpace($candidate)) {
+        continue
+      }
+
+      $key = $candidate.ToLowerInvariant()
+      if (-not $seen.ContainsKey($key)) {
+        $seen[$key] = $true
+        $entries.Add($candidate)
+      }
+    }
+  }
+
+  foreach ($candidate in @(
+      '127.0.0.1',
+      'localhost',
+      '::1',
+      'open.feishu.cn',
+      '.feishu.cn',
+      'open.larksuite.com',
+      '.larksuite.com'
+    )) {
+    $key = $candidate.ToLowerInvariant()
+    if (-not $seen.ContainsKey($key)) {
+      $seen[$key] = $true
+      $entries.Add($candidate)
+    }
+  }
+
+  return ($entries -join ',')
+}
+
 function Get-OpenClawEntryPath {
   $prefix = Get-OpenClawPrefix
   $entry = Join-Path $prefix "node_modules\openclaw\openclaw.mjs"
@@ -336,6 +378,7 @@ function Get-OpenClawGatewayLauncherVbsContent {
   $nodeExe = Get-OpenClawNodeExePath
   $entry = Get-OpenClawEntryPath
   $serviceVersion = Get-OpenClawCurrentVersion
+  $noProxy = Get-OpenClawNoProxyValue
   if ([string]::IsNullOrWhiteSpace($entry)) {
     $entry = Join-Path (Get-OpenClawDefaultPrefix) "node_modules\openclaw\openclaw.mjs"
   }
@@ -355,6 +398,8 @@ env("OPENCLAW_WINDOWS_TASK_NAME") = "$($context.GatewayTask)"
 env("OPENCLAW_SERVICE_MARKER") = "openclaw"
 env("OPENCLAW_SERVICE_KIND") = "gateway"
 env("OPENCLAW_SERVICE_VERSION") = "$serviceVersion"
+env("NO_PROXY") = "$noProxy"
+env("no_proxy") = "$noProxy"
 shell.Run """" & "$nodeExe" & """" & " --disable-warning=ExperimentalWarning " & """" & "$entry" & """" & " gateway --port $($context.GatewayPort) --force", 0, False
 "@
 }
@@ -364,6 +409,7 @@ function Get-OpenClawGatewayCmdContent {
   $nodeExe = Get-OpenClawNodeExePath
   $entry = Get-OpenClawEntryPath
   $serviceVersion = Get-OpenClawCurrentVersion
+  $noProxy = Get-OpenClawNoProxyValue
   if ([string]::IsNullOrWhiteSpace($entry)) {
     $entry = Join-Path (Get-OpenClawDefaultPrefix) "node_modules\openclaw\openclaw.mjs"
   }
@@ -383,6 +429,8 @@ set "OPENCLAW_WINDOWS_TASK_NAME=$($context.GatewayTask)"
 set "OPENCLAW_SERVICE_MARKER=openclaw"
 set "OPENCLAW_SERVICE_KIND=gateway"
 set "OPENCLAW_SERVICE_VERSION=$serviceVersion"
+set "NO_PROXY=$noProxy"
+set "no_proxy=$noProxy"
 "$nodeExe" --disable-warning=ExperimentalWarning "$entry" gateway --port $($context.GatewayPort) --force
 "@
 }
