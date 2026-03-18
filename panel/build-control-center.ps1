@@ -27,7 +27,51 @@ $userDesktopExe = Join-Path ([Environment]::GetFolderPath("UserProfile")) ("Desk
 $legacyOutputExe = Join-Path $distDir "OpenClaw Control Center.exe"
 $legacyDesktopExe = Join-Path $desktopRoot "OpenClaw Control Center.exe"
 $ps2exeScript = Join-Path $projectRoot ".tools\ps2exe\pkg\ps2exe.ps1"
-$pythonExe = "python"
+
+function Invoke-ProjectPython {
+  param([string]$ScriptPath)
+
+  $failures = New-Object System.Collections.Generic.List[string]
+  foreach ($launcher in @(
+    @{ Command = "python"; Args = @() },
+    @{ Command = "py"; Args = @("-3") },
+    @{ Command = "py"; Args = @() }
+  )) {
+    try {
+      $null = Get-Command $launcher.Command -ErrorAction Stop
+    } catch {
+      continue
+    }
+
+    & $launcher.Command @($launcher.Args + @($ScriptPath))
+    if ($LASTEXITCODE -eq 0) {
+      return $true
+    }
+
+    $failures.Add("Python launcher failed: $($launcher.Command) $($launcher.Args -join ' ')")
+  }
+
+  if ($failures.Count -gt 0) {
+    Write-Warning ($failures -join "; ")
+  } else {
+    Write-Warning "Missing Python runtime. Install Python or Python Launcher (py.exe)."
+  }
+
+  return $false
+}
+
+function Copy-BestEffort {
+  param(
+    [string]$SourcePath,
+    [string]$DestinationPath
+  )
+
+  try {
+    Copy-Item $SourcePath $DestinationPath -Force
+  } catch {
+    Write-Warning ("Failed to copy {0} to {1}: {2}" -f $SourcePath, $DestinationPath, $_.Exception.Message)
+  }
+}
 
 if (-not (Test-Path $ps2exeScript)) {
   throw "Missing PS2EXE script: $ps2exeScript"
@@ -50,7 +94,9 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
   Where-Object { $_.ExecutablePath -and ($knownExePaths -contains $_.ExecutablePath) } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
-& $pythonExe (Join-Path $root "generate_lobster_assets.py")
+if (-not (Invoke-ProjectPython (Join-Path $root "generate_lobster_assets.py")) -and -not (Test-Path $iconPath)) {
+  throw "Missing icon asset: $iconPath"
+}
 
 $panelTemplate = Get-Content $scriptPath -Raw
 $toolkitBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((Get-Content $toolkitPath -Raw)))
@@ -71,11 +117,11 @@ Invoke-ps2exe -inputFile $generatedScriptPath `
   -copyright "Copyright (c) 2026" `
   -version "2026.3.15.1"
 
-Copy-Item $outputExe $desktopExe -Force
+Copy-BestEffort -SourcePath $outputExe -DestinationPath $desktopExe
 if ($userDesktopExe -ne $desktopExe) {
   $userDesktopDir = Split-Path -Parent $userDesktopExe
   if (Test-Path $userDesktopDir) {
-    Copy-Item $outputExe $userDesktopExe -Force
+    Copy-BestEffort -SourcePath $outputExe -DestinationPath $userDesktopExe
   }
 }
 

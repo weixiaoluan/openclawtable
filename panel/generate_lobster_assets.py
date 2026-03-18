@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 
 ROOT = Path(__file__).resolve().parent
@@ -11,95 +11,145 @@ PNG_PATH = ASSETS / "lobster-icon.png"
 ICO_PATH = ASSETS / "lobster-icon.ico"
 
 
-def draw_lobster_icon(draw: ImageDraw.ImageDraw, size: int) -> None:
+def draw_rounded_backplate(image: Image.Image, size: int) -> None:
     scale = size / 512.0
 
     def sx(value: float) -> float:
         return value * scale
 
-    sand = "#F5E8D9"
-    sand_soft = "#FCF6EF"
-    ink = "#161616"
-    coral = "#FF6B35"
-    coral_soft = "#FF9A73"
-    line = "#FFF8EF"
-
     shadow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     shadow_draw = ImageDraw.Draw(shadow)
-    shadow_draw.rounded_rectangle((sx(52), sx(60), sx(460), sx(468)), radius=sx(128), fill=(0, 0, 0, 40))
+    shadow_draw.rounded_rectangle(
+        (sx(52), sx(60), sx(460), sx(468)),
+        radius=sx(132),
+        fill=(0, 0, 0, 36),
+    )
     shadow = shadow.filter(ImageFilter.GaussianBlur(radius=sx(18)))
-    draw.bitmap((0, 0), shadow)
+    image.alpha_composite(shadow)
 
-    draw.rounded_rectangle((sx(44), sx(44), sx(468), sx(468)), radius=sx(136), fill=sand)
-    draw.rounded_rectangle((sx(70), sx(70), sx(442), sx(442)), radius=sx(112), fill=sand_soft)
+    face = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    face_draw = ImageDraw.Draw(face)
+    face_draw.rounded_rectangle((sx(44), sx(44), sx(468), sx(468)), radius=sx(136), fill="#FCFCFD")
+    face_draw.rounded_rectangle((sx(60), sx(60), sx(452), sx(452)), radius=sx(118), fill="#FFFFFF")
+    image.alpha_composite(face)
 
-    draw.line((sx(228), sx(112), sx(196), sx(74)), fill=ink, width=int(sx(8)))
-    draw.line((sx(284), sx(112), sx(316), sx(74)), fill=ink, width=int(sx(8)))
 
+def draw_sparkle(draw: ImageDraw.ImageDraw, size: int) -> None:
+    scale = size / 512.0
+
+    def sx(value: float) -> float:
+        return value * scale
+
+    center_x = sx(120)
+    center_y = sx(110)
+    long_r = sx(52)
+    short_r = sx(24)
+    gold = "#FFCC3D"
+    gold_core = "#FFE486"
+
+    points = [
+        (center_x, center_y - long_r),
+        (center_x + sx(12), center_y - sx(12)),
+        (center_x + long_r, center_y),
+        (center_x + sx(12), center_y + sx(12)),
+        (center_x, center_y + long_r),
+        (center_x - sx(12), center_y + sx(12)),
+        (center_x - long_r, center_y),
+        (center_x - sx(12), center_y - sx(12)),
+    ]
+    draw.polygon(points, fill=gold)
     draw.polygon(
         [
-            (sx(122), sx(154)),
-            (sx(86), sx(126)),
-            (sx(100), sx(94)),
-            (sx(152), sx(112)),
-            (sx(166), sx(146)),
-            (sx(146), sx(172)),
+            (center_x, center_y - short_r),
+            (center_x + sx(8), center_y - sx(8)),
+            (center_x + short_r, center_y),
+            (center_x + sx(8), center_y + sx(8)),
+            (center_x, center_y + short_r),
+            (center_x - sx(8), center_y + sx(8)),
+            (center_x - short_r, center_y),
+            (center_x - sx(8), center_y - sx(8)),
         ],
-        fill=ink,
-    )
-    draw.polygon(
-        [
-            (sx(390), sx(154)),
-            (sx(426), sx(126)),
-            (sx(412), sx(94)),
-            (sx(360), sx(112)),
-            (sx(346), sx(146)),
-            (sx(366), sx(172)),
-        ],
-        fill=ink,
+        fill=gold_core,
     )
 
-    draw.line((sx(176), sx(172), sx(130), sx(198)), fill=ink, width=int(sx(11)))
-    draw.line((sx(336), sx(172), sx(382), sx(198)), fill=ink, width=int(sx(11)))
-    draw.line((sx(186), sx(262), sx(130), sx(286)), fill=ink, width=int(sx(9)))
-    draw.line((sx(194), sx(304), sx(140), sx(332)), fill=ink, width=int(sx(9)))
-    draw.line((sx(326), sx(262), sx(382), sx(286)), fill=ink, width=int(sx(9)))
-    draw.line((sx(318), sx(304), sx(372), sx(332)), fill=ink, width=int(sx(9)))
 
-    draw.ellipse((sx(184), sx(138), sx(328), sx(306)), fill=coral)
-    draw.ellipse((sx(206), sx(162), sx(306), sx(282)), fill=coral_soft)
+def draw_claw_icon(image: Image.Image, size: int) -> None:
+    scale = size / 512.0
 
-    draw.arc((sx(198), sx(156), sx(314), sx(228)), start=196, end=340, fill=line, width=int(sx(7)))
-    draw.arc((sx(192), sx(186), sx(320), sx(258)), start=196, end=340, fill=line, width=int(sx(7)))
-    draw.arc((sx(200), sx(216), sx(312), sx(286)), start=196, end=340, fill=line, width=int(sx(7)))
+    def sx(value: float) -> float:
+        return value * scale
 
-    draw.rounded_rectangle((sx(208), sx(292), sx(304), sx(332)), radius=sx(18), fill=coral)
-    draw.rounded_rectangle((sx(220), sx(324), sx(292), sx(362)), radius=sx(18), fill=coral_soft)
-    draw.polygon(
-        [
-            (sx(228), sx(362)),
-            (sx(194), sx(412)),
-            (sx(242), sx(400)),
-            (sx(254), sx(366)),
-        ],
-        fill=ink,
+    mask = Image.new("L", (size, size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+
+    red = "#F34A45"
+    red_dark = "#D72E30"
+    red_light = "#FF8F88"
+    red_soft = "#FFC4BC"
+    white = "#FFF7F4"
+
+    arm_mask = Image.new("L", (size, size), 0)
+    arm_draw = ImageDraw.Draw(arm_mask)
+    arm_draw.rounded_rectangle((sx(184), sx(240), sx(278), sx(446)), radius=sx(44), fill=255)
+    arm_mask = arm_mask.rotate(29, resample=Image.Resampling.BICUBIC, center=(sx(230), sx(344)))
+    mask = ImageChops.lighter(mask, arm_mask)
+    mask_draw = ImageDraw.Draw(mask)
+
+    mask_draw.ellipse((sx(246), sx(150), sx(430), sx(364)), fill=255)
+    mask_draw.ellipse((sx(144), sx(134), sx(304), sx(286)), fill=255)
+    mask_draw.ellipse((sx(192), sx(176), sx(302), sx(298)), fill=255)
+
+    # Cut the jaw opening so the silhouette matches the uploaded claw more closely.
+    mask_draw.ellipse((sx(230), sx(140), sx(338), sx(284)), fill=0)
+    mask_draw.polygon(
+        [(sx(216), sx(170)), (sx(274), sx(156)), (sx(244), sx(248)), (sx(198), sx(246))],
+        fill=0,
     )
-    draw.polygon(
-        [
-            (sx(284), sx(362)),
-            (sx(318), sx(412)),
-            (sx(270), sx(400)),
-            (sx(258), sx(366)),
-        ],
-        fill=ink,
+
+    base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    base_draw = ImageDraw.Draw(base)
+    base_draw.rectangle((0, 0, size, size), fill=red)
+    base.putalpha(mask)
+
+    shadow_alpha = mask.filter(ImageFilter.GaussianBlur(radius=sx(10)))
+    shadow = Image.new("RGBA", (size, size), (187, 37, 40, 0))
+    shadow.putalpha(shadow_alpha)
+    image.alpha_composite(shadow, dest=(0, 0))
+
+    image.alpha_composite(base)
+
+    detail = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    detail_draw = ImageDraw.Draw(detail)
+    detail_draw.ellipse((sx(276), sx(188), sx(384), sx(314)), fill=red_light)
+    detail_draw.ellipse((sx(302), sx(212), sx(352), sx(270)), fill=red_soft)
+    detail_draw.ellipse((sx(164), sx(156), sx(272), sx(256)), fill=red_light)
+    detail_draw.ellipse((sx(186), sx(180), sx(232), sx(224)), fill=red_soft)
+    detail_draw.ellipse((sx(214), sx(216), sx(270), sx(278)), fill=white)
+    detail_draw.ellipse((sx(282), sx(238), sx(328), sx(292)), fill=white)
+    detail_draw.polygon(
+        [(sx(192), sx(156)), (sx(246), sx(108)), (sx(220), sx(220))],
+        fill=red_dark,
     )
+    detail_draw.polygon(
+        [(sx(278), sx(150)), (sx(334), sx(114)), (sx(296), sx(226))],
+        fill=red_dark,
+    )
+    detail_alpha = ImageChops.multiply(detail.getchannel("A"), mask)
+    detail.putalpha(detail_alpha)
+    image.alpha_composite(detail)
+
+
+def draw_lobster_icon(image: Image.Image, size: int) -> None:
+    draw_rounded_backplate(image, size)
+    draw = ImageDraw.Draw(image)
+    draw_sparkle(draw, size)
+    draw_claw_icon(image, size)
 
 
 def main() -> None:
     size = 512
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw_lobster_icon(draw, size)
+    draw_lobster_icon(image, size)
     image.save(PNG_PATH)
     image.save(ICO_PATH, sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
 

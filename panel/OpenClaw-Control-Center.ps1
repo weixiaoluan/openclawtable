@@ -51,11 +51,13 @@ $locale = @'
   "status_click_check": "\u70b9\u51fb\u68c0\u67e5",
   "status_live": "\u6b63\u5e38",
   "status_waiting": "\u542f\u52a8\u4e2d",
+  "status_failed_gateway": "\u5f02\u5e38",
   "status_stopped_gateway": "\u5df2\u505c\u6b62",
   "status_enabled": "\u5df2\u5f00\u542f",
   "status_disabled": "\u5df2\u5173\u95ed",
   "mode_running": "\u8fd0\u884c\u4e2d",
   "mode_starting": "\u542f\u52a8\u4e2d",
+  "mode_failed": "\u542f\u52a8\u5931\u8d25",
   "mode_paused": "\u5df2\u6682\u505c",
   "mode_updating": "\u66f4\u65b0\u4e2d",
   "mode_stopped": "\u5df2\u505c\u6b62",
@@ -72,6 +74,9 @@ $locale = @'
   "busy_healthy": "\u8fd0\u884c\u6b63\u5e38",
   "msg_starting": "\u7f51\u5173\u4ecd\u5728\u542f\u52a8\u6216\u6062\u590d\u4e2d\u3002\u9759\u9ed8\u94fe\u8def\u5df2\u7ecf\u63a5\u7ba1\uff0c\u8bf7\u7a0d\u7b49\u5065\u5eb7\u72b6\u6001\u5207\u6362\u4e3a\u201c\u6b63\u5e38\u201d\u3002",
   "busy_starting": "\u542f\u52a8\u4e2d",
+  "msg_failed_template": "OpenClaw \u542f\u52a8\u5931\u8d25\uff1a{0}",
+  "msg_failed_generic": "\u540e\u53f0\u94fe\u8def\u672a\u80fd\u901a\u8fc7\u5065\u5eb7\u68c0\u67e5\uff0c\u8bf7\u5148\u5904\u7406\u62a5\u9519\u6458\u8981\u540e\u518d\u91cd\u8bd5\u3002",
+  "busy_failed": "\u542f\u52a8\u5931\u8d25",
   "msg_refreshing": "\u6b63\u5728\u5237\u65b0\u72b6\u6001...",
   "busy_refreshing": "\u5237\u65b0\u4e2d",
   "msg_refresh_failed_prefix": "\u5237\u65b0\u5931\u8d25\uff1a",
@@ -96,7 +101,9 @@ $locale = @'
   "busy_up_to_date": "\u5df2\u6700\u65b0",
   "dialog_update_title": "OpenClaw \u66f4\u65b0",
   "dialog_update_prompt_template": "\u53d1\u73b0\u65b0\u7248\u672c\uff1a{0}\n\u5f53\u524d\u7248\u672c\uff1a{1}\n\u73b0\u5728\u5f00\u59cb\u66f4\u65b0\u5417\uff1f",
+  "dialog_install_existing_prompt_template": "\u68c0\u6d4b\u5230\u672c\u5730\u5b58\u5728\u65e7\u914d\u7f6e\u6216\u5b89\u88c5\u6b8b\u7559\u3002\n\u5c06\u4fdd\u7559\u73b0\u6709\u914d\u7f6e\u5e76\u5b89\u88c5\u6700\u65b0\u7248\u672c\uff1a{0}\n\u73b0\u5728\u7ee7\u7eed\u5417\uff1f",
   "msg_update_started_template": "\u5df2\u5728\u540e\u53f0\u542f\u52a8\u66f4\u65b0\uff0c\u76ee\u6807\u7248\u672c\uff1a{0}\u3002\u66f4\u65b0\u9501\u4f1a\u5728\u8fc7\u7a0b\u4e2d\u9632\u6b62\u9759\u9ed8\u4fdd\u6d3b\u94fe\u8def\u6b7b\u5faa\u73af\u3002",
+  "msg_install_started_template": "\u5df2\u5728\u540e\u53f0\u542f\u52a8 OpenClaw \u5b89\u88c5\uff0c\u76ee\u6807\u7248\u672c\uff1a{0}\u3002",
   "busy_update_pid_template": "\u66f4\u65b0 PID {0}",
   "msg_update_canceled": "\u5df2\u53d6\u6d88\u66f4\u65b0\u3002",
   "busy_canceled": "\u5df2\u53d6\u6d88",
@@ -162,13 +169,55 @@ function Format-Loc {
 
 $embeddedToolkitBase64 = "__EMBEDDED_TOOLKIT_BASE64__"
 
-function Resolve-ToolkitPath {
-  $userHome = [Environment]::GetFolderPath("UserProfile")
-  $defaultToolkitPath = Join-Path (Join-Path $userHome ".openclaw") "openclaw-toolkit.ps1"
-  if (Test-Path $defaultToolkitPath) {
-    return $defaultToolkitPath
+function Get-ControlCenterBaseDirectory {
+  $candidates = @(
+    [System.AppContext]::BaseDirectory,
+    [System.AppDomain]::CurrentDomain.BaseDirectory,
+    $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $null }),
+    $PSScriptRoot
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+  foreach ($candidate in $candidates) {
+    try {
+      $resolved = [IO.Path]::GetFullPath($candidate)
+      if (-not [string]::IsNullOrWhiteSpace($resolved)) {
+        return $resolved.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      }
+    } catch {
+      continue
+    }
   }
 
+  return $null
+}
+
+function Get-ToolkitCandidatePaths {
+  $baseDir = Get-ControlCenterBaseDirectory
+  $candidates = New-Object System.Collections.Generic.List[string]
+
+  if (-not [string]::IsNullOrWhiteSpace($baseDir)) {
+    $parentDir = Split-Path -Parent $baseDir
+    foreach ($candidate in @(
+      (Join-Path $baseDir "openclaw-toolkit.ps1"),
+      (Join-Path $baseDir "runtime\openclaw-toolkit.ps1"),
+      $(if ($parentDir) { Join-Path $parentDir "runtime\openclaw-toolkit.ps1" } else { $null })
+    )) {
+      if (-not [string]::IsNullOrWhiteSpace($candidate) -and -not $candidates.Contains($candidate)) {
+        $candidates.Add($candidate)
+      }
+    }
+  }
+
+  $userHome = [Environment]::GetFolderPath("UserProfile")
+  $defaultToolkitPath = Join-Path (Join-Path $userHome ".openclaw") "openclaw-toolkit.ps1"
+  if (-not $candidates.Contains($defaultToolkitPath)) {
+    $candidates.Add($defaultToolkitPath)
+  }
+
+  return $candidates
+}
+
+function Resolve-ToolkitPath {
   if ($embeddedToolkitBase64 -and $embeddedToolkitBase64 -ne "__EMBEDDED_TOOLKIT_BASE64__") {
     $cacheDir = Join-Path $env:LOCALAPPDATA "OpenClawControlCenter"
     $cachedToolkitPath = Join-Path $cacheDir "openclaw-toolkit.embedded.ps1"
@@ -177,7 +226,18 @@ function Resolve-ToolkitPath {
     return $cachedToolkitPath
   }
 
-  return $defaultToolkitPath
+  $toolkitCandidates = Get-ToolkitCandidatePaths
+  foreach ($candidate in $toolkitCandidates) {
+    if (Test-Path $candidate) {
+      return $candidate
+    }
+  }
+
+  if ($toolkitCandidates.Count -gt 0) {
+    return $toolkitCandidates[$toolkitCandidates.Count - 1]
+  }
+
+  return (Join-Path (Join-Path ([Environment]::GetFolderPath("UserProfile")) ".openclaw") "openclaw-toolkit.ps1")
 }
 
 $toolkitPath = Resolve-ToolkitPath
@@ -192,6 +252,18 @@ if (-not (Test-Path $toolkitPath)) {
 }
 
 . $toolkitPath
+
+try {
+  Ensure-OpenClawRuntimeFiles
+} catch {
+  [System.Windows.MessageBox]::Show(
+    ("初始化运行时脚本失败：`n{0}" -f $_.Exception.Message),
+    (Get-LocText "missing_toolkit_title"),
+    [System.Windows.MessageBoxButton]::OK,
+    [System.Windows.MessageBoxImage]::Error
+  ) | Out-Null
+  exit 1
+}
 
 $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -516,6 +588,7 @@ function Convert-ModeText {
   switch ($Mode) {
     "Running" { return Get-LocText "mode_running" }
     "Starting" { return Get-LocText "mode_starting" }
+    "Failed" { return Get-LocText "mode_failed" }
     "Paused" { return Get-LocText "mode_paused" }
     "Updating" { return Get-LocText "mode_updating" }
     "Stopped" { return Get-LocText "mode_stopped" }
@@ -541,6 +614,10 @@ function Convert-GatewayHealthText {
 
   if ($Status.GatewayHealthy) {
     return Get-LocText "status_live"
+  }
+
+  if ($Status.Mode -eq "Failed") {
+    return Get-LocText "status_failed_gateway"
   }
 
   if ($Status.Paused -or $Status.Mode -eq "Paused" -or $Status.Mode -eq "Stopped") {
@@ -637,6 +714,9 @@ function Set-DefaultOperationMessage {
     Set-OperationMessage -Message (Get-LocText "msg_paused") -BusyLabel (Get-LocText "busy_paused")
   } elseif ($status.GatewayHealthy) {
     Set-OperationMessage -Message (Get-LocText "msg_healthy") -BusyLabel (Get-LocText "busy_healthy")
+  } elseif ($status.Mode -eq "Failed") {
+    $failureReason = if ($status.FailureReason) { [string]$status.FailureReason } else { Get-LocText "msg_failed_generic" }
+    Set-OperationMessage -Message ((Get-LocText "msg_failed_template") -f $failureReason) -BusyLabel (Get-LocText "busy_failed")
   } else {
     Set-OperationMessage -Message (Get-LocText "msg_starting") -BusyLabel (Get-LocText "busy_starting")
   }
@@ -659,6 +739,16 @@ function Apply-StatusPayload {
   } elseif ($script:LatestVersionCache) {
     $status.LatestVersion = $script:LatestVersionCache
     $status.UpdateAvailable = ((Compare-OpenClawVersion $script:LatestVersionCache $status.CurrentVersion) -gt 0)
+  }
+
+  if (-not ($status.PSObject.Properties.Name -contains "IsInstalled")) {
+    $installedDefault = -not [string]::IsNullOrWhiteSpace([string]$status.CommandPath)
+    Add-Member -InputObject $status -NotePropertyName "IsInstalled" -NotePropertyValue $installedDefault -Force
+  }
+
+  if (-not ($status.PSObject.Properties.Name -contains "HasExistingConfig")) {
+    $openClawHome = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".openclaw"
+    Add-Member -InputObject $status -NotePropertyName "HasExistingConfig" -NotePropertyValue (Test-Path $openClawHome) -Force
   }
 
   $script:LastStatus = $status
@@ -999,21 +1089,34 @@ $errors = Get-OpenClawRecentErrorSummary -MaxItems 12
         return
       }
 
-      if (-not $status.UpdateAvailable) {
+      $hasInstalledVersion = -not [string]::IsNullOrWhiteSpace($status.CurrentVersion)
+      $hasInstalledOrResidualState = [bool]$status.IsInstalled -or [bool]$status.HasExistingConfig
+      $requiresConfirmation = $hasInstalledOrResidualState
+      $isFreshInstall = -not $hasInstalledOrResidualState
+
+      if ($hasInstalledVersion -and -not $status.UpdateAvailable) {
         Set-UserOperationMessage -Message (Format-Loc "msg_up_to_date_template" @($status.CurrentVersion)) -BusyLabel (Get-LocText "busy_up_to_date")
         return
       }
 
-      $prompt = [System.Windows.MessageBox]::Show(
-        (Format-Loc "dialog_update_prompt_template" @($status.LatestVersion, $status.CurrentVersion)),
-        (Get-LocText "dialog_update_title"),
-        [System.Windows.MessageBoxButton]::YesNo,
-        [System.Windows.MessageBoxImage]::Question
-      )
+      if ($requiresConfirmation) {
+        $promptMessage = if ($hasInstalledVersion) {
+          Format-Loc "dialog_update_prompt_template" @($status.LatestVersion, $status.CurrentVersion)
+        } else {
+          Format-Loc "dialog_install_existing_prompt_template" @($status.LatestVersion)
+        }
 
-      if ($prompt -ne [System.Windows.MessageBoxResult]::Yes) {
-        Set-UserOperationMessage -Message (Get-LocText "msg_update_canceled") -BusyLabel (Get-LocText "busy_canceled")
-        return
+        $prompt = [System.Windows.MessageBox]::Show(
+          $promptMessage,
+          (Get-LocText "dialog_update_title"),
+          [System.Windows.MessageBoxButton]::YesNo,
+          [System.Windows.MessageBoxImage]::Question
+        )
+
+        if ($prompt -ne [System.Windows.MessageBoxResult]::Yes) {
+          Set-UserOperationMessage -Message (Get-LocText "msg_update_canceled") -BusyLabel (Get-LocText "busy_canceled")
+          return
+        }
       }
 
       $updateBody = @'
@@ -1025,16 +1128,22 @@ $proc = Start-OpenClawUpdate -TargetVersion $targetVersion
 }
 '@
 
+      $updateStartedSuccess = {
+        param($updatePayload)
+        if ($isFreshInstall) {
+          Set-UserOperationMessage -Message (Format-Loc "msg_install_started_template" @($updatePayload.TargetVersion)) -BusyLabel (Format-Loc "busy_update_pid_template" @($updatePayload.ProcessId))
+        } else {
+          Set-UserOperationMessage -Message (Format-Loc "msg_update_started_template" @($updatePayload.TargetVersion)) -BusyLabel (Format-Loc "busy_update_pid_template" @($updatePayload.ProcessId))
+        }
+        Request-PanelRefresh -IncludeLatestVersion
+      }.GetNewClosure()
+
       Start-StatusAction -Name "start-update" `
         -BusyMessage (Get-LocText "msg_updating") `
         -BusyLabel (Get-LocText "busy_updating") `
         -Body $updateBody `
         -Arguments @($status.LatestVersion) `
-        -OnSuccess {
-          param($updatePayload)
-          Set-UserOperationMessage -Message (Format-Loc "msg_update_started_template" @($updatePayload.TargetVersion)) -BusyLabel (Format-Loc "busy_update_pid_template" @($updatePayload.ProcessId))
-          Request-PanelRefresh -IncludeLatestVersion -ForceDefaultMessage
-        } `
+        -OnSuccess $updateStartedSuccess `
         -OnError {
           param($message)
           Set-UserOperationMessage -Message ((Get-LocText "msg_update_check_failed_prefix") + $message) -BusyLabel (Get-LocText "busy_check_failed")
