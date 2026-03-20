@@ -7,6 +7,30 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Microsoft.VisualBasic
 
+trap {
+  $message = $_.Exception.Message
+  $line = $null
+  try {
+    if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
+      $line = [string]$_.InvocationInfo.ScriptLineNumber
+    }
+  } catch {}
+
+  $details = if ([string]::IsNullOrWhiteSpace($line)) {
+    "启动失败：$message"
+  } else {
+    "启动失败：$message`n行号：$line"
+  }
+
+  try {
+    [System.Windows.Forms.MessageBox]::Show($details, "OpenClaw 控制中心", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+  } catch {
+    Write-Error $details
+  }
+
+  exit 1
+}
+
 $locale = @'
 {
   "window_title": "OpenClaw \u63a7\u5236\u4e2d\u5fc3",
@@ -169,6 +193,53 @@ function Format-Loc {
 
 $embeddedToolkitBase64 = "__EMBEDDED_TOOLKIT_BASE64__"
 
+function Get-PreferredDirectoryPath {
+  param(
+    [string[]]$Candidates
+  )
+
+  foreach ($candidate in @($Candidates)) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      continue
+    }
+
+    try {
+      $resolved = [IO.Path]::GetFullPath($candidate)
+      if (-not [string]::IsNullOrWhiteSpace($resolved)) {
+        return $resolved.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return $null
+}
+
+function Get-ControlCenterUserHome {
+  return Get-PreferredDirectoryPath @(
+    [Environment]::GetFolderPath("UserProfile"),
+    $env:USERPROFILE,
+    $env:HOMEDRIVE + $env:HOMEPATH
+  )
+}
+
+function Get-ControlCenterDesktopDirectory {
+  return Get-PreferredDirectoryPath @(
+    [Environment]::GetFolderPath("Desktop"),
+    $(if (-not [string]::IsNullOrWhiteSpace((Get-ControlCenterUserHome))) { Join-Path (Get-ControlCenterUserHome) "Desktop" } else { $null }),
+    (Get-ControlCenterBaseDirectory)
+  )
+}
+
+function Get-ControlCenterCacheDirectory {
+  return Get-PreferredDirectoryPath @(
+    $(if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Join-Path $env:LOCALAPPDATA "OpenClawControlCenter" } else { $null }),
+    $(if (-not [string]::IsNullOrWhiteSpace($env:TEMP)) { Join-Path $env:TEMP "OpenClawControlCenter" } else { $null }),
+    $(if (-not [string]::IsNullOrWhiteSpace((Get-ControlCenterBaseDirectory))) { Join-Path (Get-ControlCenterBaseDirectory) ".cache" } else { $null })
+  )
+}
+
 function Get-ControlCenterBaseDirectory {
   $candidates = @(
     [System.AppContext]::BaseDirectory,
@@ -208,24 +279,30 @@ function Get-ToolkitCandidatePaths {
     }
   }
 
-  $userHome = [Environment]::GetFolderPath("UserProfile")
-  $defaultToolkitPath = Join-Path (Join-Path $userHome ".openclaw") "openclaw-toolkit.ps1"
-  if (-not $candidates.Contains($defaultToolkitPath)) {
-    $candidates.Add($defaultToolkitPath)
+  $userHome = Get-ControlCenterUserHome
+  if (-not [string]::IsNullOrWhiteSpace($userHome)) {
+    $defaultToolkitPath = Join-Path (Join-Path $userHome ".openclaw") "openclaw-toolkit.ps1"
+    if (-not $candidates.Contains($defaultToolkitPath)) {
+      $candidates.Add($defaultToolkitPath)
+    }
   }
 
   return $candidates
 }
 
-function Resolve-ToolkitPath {
+function Get-EmbeddedToolkitContent {
   if ($embeddedToolkitBase64 -and $embeddedToolkitBase64 -ne "__EMBEDDED_TOOLKIT_BASE64__") {
-    $cacheDir = Join-Path $env:LOCALAPPDATA "OpenClawControlCenter"
-    $cachedToolkitPath = Join-Path $cacheDir "openclaw-toolkit.embedded.ps1"
-    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-    [IO.File]::WriteAllBytes($cachedToolkitPath, [Convert]::FromBase64String($embeddedToolkitBase64))
-    return $cachedToolkitPath
+    try {
+      return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($embeddedToolkitBase64))
+    } catch {
+      return $null
+    }
   }
 
+  return $null
+}
+
+function Resolve-ToolkitPath {
   $toolkitCandidates = Get-ToolkitCandidatePaths
   foreach ($candidate in $toolkitCandidates) {
     if (Test-Path $candidate) {
@@ -237,11 +314,30 @@ function Resolve-ToolkitPath {
     return $toolkitCandidates[$toolkitCandidates.Count - 1]
   }
 
-  return (Join-Path (Join-Path ([Environment]::GetFolderPath("UserProfile")) ".openclaw") "openclaw-toolkit.ps1")
+  $userHome = Get-ControlCenterUserHome
+  if (-not [string]::IsNullOrWhiteSpace($userHome)) {
+    return (Join-Path (Join-Path $userHome ".openclaw") "openclaw-toolkit.ps1")
+  }
+
+  return $null
 }
 
-$toolkitPath = Resolve-ToolkitPath
-if (-not (Test-Path $toolkitPath)) {
+$toolkitContent = Get-EmbeddedToolkitContent
+$toolkitPath = $null
+
+if (-not [string]::IsNullOrWhiteSpace($toolkitContent)) {
+  $script:OpenClawToolkitSelfPath = $null
+  $script:OpenClawToolkitSelfContent = $toolkitContent
+  . ([scriptblock]::Create($toolkitContent))
+} else {
+  $toolkitPath = Resolve-ToolkitPath
+}
+
+if (-not $toolkitPath) {
+  $toolkitPath = Resolve-ToolkitPath
+}
+
+if (-not $toolkitContent -and -not (Test-Path $toolkitPath)) {
   [System.Windows.MessageBox]::Show(
     (Format-Loc "missing_toolkit_message" @($toolkitPath)),
     (Get-LocText "missing_toolkit_title"),
@@ -251,10 +347,18 @@ if (-not (Test-Path $toolkitPath)) {
   exit 1
 }
 
-. $toolkitPath
+if (-not $toolkitContent) {
+  . $toolkitPath
+}
 
 try {
   Ensure-OpenClawRuntimeFiles
+  if (Get-Command Get-OpenClawContext -ErrorAction SilentlyContinue) {
+    $context = Get-OpenClawContext
+    if ($context -and $context.ToolkitScript -and (Test-Path $context.ToolkitScript)) {
+      $toolkitPath = $context.ToolkitScript
+    }
+  }
 } catch {
   [System.Windows.MessageBox]::Show(
     ("初始化运行时脚本失败：`n{0}" -f $_.Exception.Message),
@@ -747,8 +851,9 @@ function Apply-StatusPayload {
   }
 
   if (-not ($status.PSObject.Properties.Name -contains "HasExistingConfig")) {
-    $openClawHome = Join-Path ([Environment]::GetFolderPath("UserProfile")) ".openclaw"
-    Add-Member -InputObject $status -NotePropertyName "HasExistingConfig" -NotePropertyValue (Test-Path $openClawHome) -Force
+    $userHome = Get-ControlCenterUserHome
+    $openClawHome = if (-not [string]::IsNullOrWhiteSpace($userHome)) { Join-Path $userHome ".openclaw" } else { $null }
+    Add-Member -InputObject $status -NotePropertyName "HasExistingConfig" -NotePropertyValue ($openClawHome -and (Test-Path $openClawHome)) -Force
   }
 
   $script:LastStatus = $status
@@ -1202,7 +1307,8 @@ $ui.RestoreButton.Add_Click({
     $dialog.InitialDirectory = if ($script:LastStatus -and $script:LastStatus.BackupRoot -and (Test-Path $script:LastStatus.BackupRoot)) {
       $script:LastStatus.BackupRoot
     } else {
-      Join-Path ([Environment]::GetFolderPath("UserProfile")) ".openclaw\backups"
+      $userHome = Get-ControlCenterUserHome
+      if (-not [string]::IsNullOrWhiteSpace($userHome)) { Join-Path $userHome ".openclaw\backups" } else { Get-ControlCenterBaseDirectory }
     }
 
     if (-not $dialog.ShowDialog()) {
@@ -1255,7 +1361,7 @@ $ui.ExportLogsButton.Add_Click({
     $dialog = New-Object Microsoft.Win32.SaveFileDialog
     $dialog.FileName = (Format-Loc "export_filename_template" @((Get-Date -Format "yyyyMMdd-HHmmss")))
     $dialog.Filter = Get-LocText "export_filter"
-    $dialog.InitialDirectory = [Environment]::GetFolderPath("Desktop")
+    $dialog.InitialDirectory = Get-ControlCenterDesktopDirectory
 
     if (-not $dialog.ShowDialog()) {
       Set-UserOperationMessage -Message (Get-LocText "msg_log_export_canceled") -BusyLabel (Get-LocText "busy_canceled")

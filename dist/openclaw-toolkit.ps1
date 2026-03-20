@@ -3,8 +3,12 @@
 try { Add-Type -AssemblyName System.IO.Compression } catch {}
 try { Add-Type -AssemblyName System.IO.Compression.FileSystem } catch {}
 
-$script:OpenClawToolkitSelfPath = $PSCommandPath
-$script:OpenClawToolkitSelfContent = if ($PSCommandPath -and (Test-Path $PSCommandPath)) { Get-Content $PSCommandPath -Raw } else { $null }
+if (-not (Get-Variable -Name OpenClawToolkitSelfPath -Scope Script -ErrorAction SilentlyContinue)) {
+  $script:OpenClawToolkitSelfPath = $PSCommandPath
+}
+if (-not (Get-Variable -Name OpenClawToolkitSelfContent -Scope Script -ErrorAction SilentlyContinue)) {
+  $script:OpenClawToolkitSelfContent = if ($PSCommandPath -and (Test-Path $PSCommandPath)) { Get-Content $PSCommandPath -Raw } else { $null }
+}
 
 function Get-OpenClawUserHome {
   return [Environment]::GetFolderPath("UserProfile")
@@ -153,6 +157,8 @@ function Get-OpenClawContext {
     UserHome = $userHome
     Home = $openClawHome
     PauseFile = Join-Path $openClawHome ".paused"
+    AutoStartMarkerFile = Join-Path $openClawHome ".autostart-enabled"
+    DesiredRunMarkerFile = Join-Path $openClawHome ".desired-running"
     DesiredRunUntilFile = Join-Path $openClawHome ".desired-running-until"
     UpgradeLockFile = Join-Path $openClawHome ".upgrade-lock"
     LauncherVbs = Join-Path $openClawHome "run-hidden.vbs"
@@ -178,6 +184,7 @@ function Get-OpenClawContext {
     DefaultPrefix = $defaultPrefix
     KeepaliveTask = "OpenClaw Gateway Keepalive"
     GatewayTask = "OpenClaw Gateway"
+    AutoStartTask = "OpenClaw Gateway AutoStart"
     GatewayPort = $gatewayPort
     HealthzUrl = ("http://127.0.0.1:{0}/healthz" -f $gatewayPort)
     Desktop = [Environment]::GetFolderPath("Desktop")
@@ -289,6 +296,7 @@ function Set-OpenClawDesiredRunWindow {
 
   $context = Get-OpenClawContext
   New-Item -ItemType Directory -Path $context.Home -Force | Out-Null
+  Set-Content -Path $context.DesiredRunMarkerFile -Value "enabled" -Encoding ASCII
   $deadline = (Get-Date).AddHours($Hours).ToString("s")
   Set-Content -Path $context.DesiredRunUntilFile -Value $deadline -Encoding ASCII
   return $deadline
@@ -296,6 +304,7 @@ function Set-OpenClawDesiredRunWindow {
 
 function Clear-OpenClawDesiredRunWindow {
   $context = Get-OpenClawContext
+  Remove-Item $context.DesiredRunMarkerFile -Force -ErrorAction SilentlyContinue
   Remove-Item $context.DesiredRunUntilFile -Force -ErrorAction SilentlyContinue
 }
 
@@ -318,12 +327,26 @@ function Get-OpenClawDesiredRunDeadline {
 }
 
 function Test-OpenClawDesiredRunActive {
+  $context = Get-OpenClawContext
+  $autoStartEnabled = Test-Path $context.AutoStartMarkerFile
+  $persistentMarker = Test-Path $context.DesiredRunMarkerFile
   $deadline = Get-OpenClawDesiredRunDeadline
+
+  if (($persistentMarker -or $autoStartEnabled) -and $null -eq $deadline) {
+    [void](Set-OpenClawDesiredRunWindow)
+    return $true
+  }
+
   if ($null -eq $deadline) {
     return $false
   }
 
   if ($deadline -le (Get-Date)) {
+    if ($persistentMarker -or $autoStartEnabled) {
+      [void](Set-OpenClawDesiredRunWindow)
+      return $true
+    }
+
     Clear-OpenClawDesiredRunWindow
     return $false
   }
@@ -337,6 +360,7 @@ Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
 pauseFile = fso.BuildPath(baseDir, ".paused")
+desiredRunMarkerFile = fso.BuildPath(baseDir, ".desired-running")
 desiredRunFile = fso.BuildPath(baseDir, ".desired-running-until")
 upgradeLockFile = fso.BuildPath(baseDir, ".upgrade-lock")
 watchdogLauncher = fso.BuildPath(baseDir, "watchdog-launcher.vbs")
@@ -355,6 +379,9 @@ End If
 If fso.FileExists(upgradeLockFile) Then
   WScript.Quit 0
 End If
+Set markerStream = fso.CreateTextFile(desiredRunMarkerFile, True, False)
+markerStream.Write "enabled"
+markerStream.Close
 Set stream = fso.CreateTextFile(desiredRunFile, True, False)
 stream.Write ToIsoLocal(DateAdd("h", 24, Now))
 stream.Close
@@ -443,6 +470,8 @@ $ErrorActionPreference = "Stop"
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $baseDir
 $pauseFile = Join-Path $baseDir ".paused"
+$autoStartMarkerFile = Join-Path $baseDir ".autostart-enabled"
+$desiredRunMarkerFile = Join-Path $baseDir ".desired-running"
 $desiredRunUntilFile = Join-Path $baseDir ".desired-running-until"
 $upgradeLockFile = Join-Path $baseDir ".upgrade-lock"
 
@@ -458,7 +487,8 @@ $logDir = Join-Path $env:LOCALAPPDATA "Temp\openclaw"
 $logFile = Join-Path $logDir "gateway-watchdog.log"
 $maxLogBytes = 1MB
 $gatewayTask = "OpenClaw Gateway"
-$startupGraceSeconds = 900
+$coldStartGraceSeconds = 360
+$listeningGraceSeconds = 600
 $port = __OPENCLAW_PORT__
 $healthzUrl = "http://127.0.0.1:$port/healthz"
 
@@ -502,6 +532,16 @@ function Get-GatewayProcesses {
 }
 
 function Test-DesiredRunActive {
+  $autoStartEnabled = Test-Path $autoStartMarkerFile
+  $persistentMarker = Test-Path $desiredRunMarkerFile
+
+  if (($persistentMarker -or $autoStartEnabled) -and -not (Test-Path $desiredRunUntilFile)) {
+    try {
+      Set-Content -Path $desiredRunUntilFile -Value ((Get-Date).AddHours(24).ToString("s")) -Encoding ASCII
+    } catch {}
+    return $true
+  }
+
   if (-not (Test-Path $desiredRunUntilFile)) {
     return $false
   }
@@ -515,10 +555,22 @@ function Test-DesiredRunActive {
   }
 
   if ($deadline -le (Get-Date)) {
+    if ($persistentMarker -or $autoStartEnabled) {
+      try {
+        Set-Content -Path $desiredRunUntilFile -Value ((Get-Date).AddHours(24).ToString("s")) -Encoding ASCII
+      } catch {}
+      return $true
+    }
+
     Write-Log "desired run window expired at $deadline; removing marker"
     Remove-Item $desiredRunUntilFile -Force -ErrorAction SilentlyContinue
     return $false
   }
+
+  try {
+    $renewedDeadline = (Get-Date).AddHours(24).ToString("s")
+    Set-Content -Path $desiredRunUntilFile -Value $renewedDeadline -Encoding ASCII
+  } catch {}
 
   return $true
 }
@@ -579,6 +631,23 @@ function Test-GatewayProbe {
   }
 }
 
+function Test-GatewayPortListening {
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $async = $client.BeginConnect("127.0.0.1", $port, $null, $null)
+    if (-not $async.AsyncWaitHandle.WaitOne(1500, $false)) {
+      return $false
+    }
+
+    $client.EndConnect($async)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $client.Dispose()
+  }
+}
+
 function Stop-GatewayProcesses {
   param([System.Object[]]$Processes)
 
@@ -602,7 +671,8 @@ function Test-WithinStartupGrace {
   try {
     $proc = Get-Process -Id $ProcessInfo.ProcessId -ErrorAction Stop
     $startedAt = $proc.StartTime
-    return (((Get-Date) - $startedAt).TotalSeconds -lt $startupGraceSeconds)
+    $graceSeconds = if (Test-GatewayPortListening) { $listeningGraceSeconds } else { $coldStartGraceSeconds }
+    return (((Get-Date) - $startedAt).TotalSeconds -lt $graceSeconds)
   } catch {
     return $false
   }
@@ -708,12 +778,17 @@ try {
     exit 0
   }
 
+  $portListening = Test-GatewayPortListening
   $gatewayProcesses = @(Get-GatewayProcesses)
   if ($gatewayProcesses.Count -gt 1) {
     Write-Log "found $($gatewayProcesses.Count) gateway processes; stopping duplicates before restart"
   } elseif ($gatewayProcesses.Count -eq 1) {
     if (Test-WithinStartupGrace -ProcessInfo $gatewayProcesses[0]) {
-      Write-Log "gateway pid=$($gatewayProcesses[0].ProcessId) still within startup grace; no action needed"
+      if ($portListening) {
+        Write-Log "gateway pid=$($gatewayProcesses[0].ProcessId) is listening but not healthy yet; still within readiness grace"
+      } else {
+        Write-Log "gateway pid=$($gatewayProcesses[0].ProcessId) still within startup grace; no action needed"
+      }
       exit 0
     }
     Write-Log "probe unhealthy with gateway process pid=$($gatewayProcesses[0].ProcessId); restarting task"
@@ -754,6 +829,54 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 Add-Content -Path $logFile -Value ("[{0}] supervisor deprecated; watchdog handles recovery directly" -f (Get-Date -Format "yyyy/MM/dd ddd HH:mm:ss.ff"))
 exit 0
 '@
+}
+
+function Set-OpenClawToolsFullAccess {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ConfigPath
+  )
+
+  if (-not (Test-Path $ConfigPath)) {
+    throw "OpenClaw config not found: $ConfigPath"
+  }
+
+  $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -Depth 100
+
+  if (-not $config.tools) {
+    $config | Add-Member -NotePropertyName tools -NotePropertyValue ([pscustomobject]@{})
+  }
+
+  if (-not $config.tools.elevated) {
+    $config.tools | Add-Member -NotePropertyName elevated -NotePropertyValue ([pscustomobject]@{})
+  }
+  $config.tools.elevated.enabled = $true
+  $config.tools.elevated.allowFrom = [pscustomobject]@{
+    feishu   = @("*")
+    telegram = @("*")
+    discord  = @("*")
+  }
+
+  if (-not $config.tools.exec) {
+    $config.tools | Add-Member -NotePropertyName exec -NotePropertyValue ([pscustomobject]@{})
+  }
+  $config.tools.exec.host = "gateway"
+  $config.tools.exec.security = "full"
+  $config.tools.exec.ask = "off"
+
+  if (-not $config.tools.exec.applyPatch) {
+    $config.tools.exec | Add-Member -NotePropertyName applyPatch -NotePropertyValue ([pscustomobject]@{})
+  }
+  $config.tools.exec.applyPatch.enabled = $true
+  $config.tools.exec.applyPatch.workspaceOnly = $false
+
+  if (-not $config.tools.fs) {
+    $config.tools | Add-Member -NotePropertyName fs -NotePropertyValue ([pscustomobject]@{})
+  }
+  $config.tools.fs.workspaceOnly = $false
+
+  $json = $config | ConvertTo-Json -Depth 100
+  [System.IO.File]::WriteAllText($ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
 
 function Get-OpenClawUpgradeScriptContent {
@@ -981,6 +1104,15 @@ function Ensure-OpenClawKeepaliveTask {
   $context = Get-OpenClawContext
   Ensure-OpenClawRuntimeFiles
 
+  $existingAction = Get-OpenClawTaskActionText -TaskName $context.KeepaliveTask
+  if (-not [string]::IsNullOrWhiteSpace($existingAction)) {
+    if (Test-OpenClawTaskMatchesLauncher -TaskName $context.KeepaliveTask -LauncherPath $context.WatchdogLauncherVbs) {
+      return $true
+    }
+
+    Remove-OpenClawTask -TaskName $context.KeepaliveTask
+  }
+
   $watchdogArgument = ('wscript.exe "{0}"' -f $context.WatchdogLauncherVbs)
 
   try {
@@ -993,15 +1125,27 @@ function Ensure-OpenClawKeepaliveTask {
       "/F"
     ) | Out-Null
 
-    return ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -eq 0) {
+      return $true
+    }
   } catch {
-    return $false
   }
+
+  return ($null -ne (Get-OpenClawTaskState -TaskName $context.KeepaliveTask))
 }
 
 function Ensure-OpenClawGatewayTask {
   $context = Get-OpenClawContext
   Ensure-OpenClawRuntimeFiles
+
+  $existingAction = Get-OpenClawTaskActionText -TaskName $context.GatewayTask
+  if (-not [string]::IsNullOrWhiteSpace($existingAction)) {
+    if (Test-OpenClawTaskMatchesLauncher -TaskName $context.GatewayTask -LauncherPath $context.GatewayLauncherVbs) {
+      return $true
+    }
+
+    Remove-OpenClawTask -TaskName $context.GatewayTask
+  }
 
   try {
     & schtasks.exe @(
@@ -1014,10 +1158,13 @@ function Ensure-OpenClawGatewayTask {
       "/F"
     ) | Out-Null
 
-    return ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -eq 0) {
+      return $true
+    }
   } catch {
-    return $false
   }
+
+  return ($null -ne (Get-OpenClawTaskState -TaskName $context.GatewayTask))
 }
 
 function Assert-OpenClawGatewayTask {
@@ -1027,9 +1174,7 @@ function Assert-OpenClawGatewayTask {
     throw ("无法创建 Windows 网关任务 {0}。请检查任务计划程序服务与当前用户权限。" -f $context.GatewayTask)
   }
 
-  try {
-    $null = Get-ScheduledTask -TaskName $context.GatewayTask -ErrorAction Stop
-  } catch {
+  if ($null -eq (Get-OpenClawTaskState -TaskName $context.GatewayTask)) {
     throw ("找不到 Windows 网关任务 {0}。请检查任务计划程序服务与当前用户权限。" -f $context.GatewayTask)
   }
 }
@@ -1041,9 +1186,7 @@ function Assert-OpenClawKeepaliveTask {
     throw ("无法创建 Windows 保活任务 {0}。请检查任务计划程序服务与当前用户权限。" -f $context.KeepaliveTask)
   }
 
-  try {
-    $null = Get-ScheduledTask -TaskName $context.KeepaliveTask -ErrorAction Stop
-  } catch {
+  if ($null -eq (Get-OpenClawTaskState -TaskName $context.KeepaliveTask)) {
     throw ("找不到 Windows 保活任务 {0}。请检查任务计划程序服务与当前用户权限。" -f $context.KeepaliveTask)
   }
 }
@@ -1271,6 +1414,84 @@ function Get-OpenClawTaskState {
   return $null
 }
 
+function Get-OpenClawTaskActionText {
+  param(
+    [string]$TaskName
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TaskName)) {
+    return $null
+  }
+
+  try {
+    $raw = & schtasks.exe @("/Query", "/TN", $TaskName, "/V", "/FO", "LIST") 2>$null
+    $line = $raw | Where-Object { $_ -match '^\s*Task To Run:\s*' } | Select-Object -First 1
+    if ($line) {
+      return ($line -replace '^\s*Task To Run:\s*', '').Trim()
+    }
+  } catch {}
+
+  return $null
+}
+
+function Test-OpenClawTaskMatchesLauncher {
+  param(
+    [string]$TaskName,
+    [string]$LauncherPath
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TaskName) -or [string]::IsNullOrWhiteSpace($LauncherPath)) {
+    return $false
+  }
+
+  $actionText = Get-OpenClawTaskActionText -TaskName $TaskName
+  if ([string]::IsNullOrWhiteSpace($actionText)) {
+    return $false
+  }
+
+  $normalizedAction = $actionText.ToLowerInvariant()
+  $normalizedLauncher = $LauncherPath.ToLowerInvariant()
+  return ($normalizedAction.Contains("wscript.exe") -and $normalizedAction.Contains($normalizedLauncher))
+}
+
+function Remove-OpenClawTask {
+  param(
+    [string]$TaskName
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TaskName)) {
+    return
+  }
+
+  try {
+    & schtasks.exe @("/End", "/TN", $TaskName) | Out-Null
+  } catch {}
+  try {
+    & schtasks.exe @("/Delete", "/TN", $TaskName, "/F") | Out-Null
+  } catch {}
+}
+
+function Get-OpenClawAuxiliaryProcesses {
+  Get-CimInstance Win32_Process -Filter "Name = 'wscript.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
+    Where-Object {
+      ($_.Name -eq "wscript.exe" -and (
+        $_.CommandLine -like "*run-hidden.vbs*" -or
+        $_.CommandLine -like "*watchdog-launcher.vbs*" -or
+        $_.CommandLine -like "*gateway-launcher.vbs*"
+      )) -or
+      ($_.Name -like "powershell*" -and (
+        $_.CommandLine -like "*gateway-watchdog.ps1*" -or
+        $_.CommandLine -like "*gateway-supervisor.ps1*"
+      ))
+    }
+}
+
+function Stop-OpenClawAuxiliaryProcesses {
+  foreach ($proc in @(Get-OpenClawAuxiliaryProcesses)) {
+    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-OpenClawLatestVersion {
   try {
     $latest = Invoke-RestMethod -UseBasicParsing -Uri "https://registry.npmjs.org/openclaw/latest" -TimeoutSec 20
@@ -1367,6 +1588,13 @@ function Test-OpenClawGatewayHealthy {
 
 function Test-OpenClawGatewayPortListening {
   $context = Get-OpenClawContext
+  try {
+    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $context.GatewayPort -ErrorAction Stop)
+    if ($listeners.Count -gt 0) {
+      return $true
+    }
+  } catch {}
+
   $client = New-Object System.Net.Sockets.TcpClient
   try {
     $async = $client.BeginConnect("127.0.0.1", $context.GatewayPort, $null, $null)
@@ -1383,10 +1611,31 @@ function Test-OpenClawGatewayPortListening {
   }
 }
 
+function Get-OpenClawGatewayListeningPids {
+  $context = Get-OpenClawContext
+  $pids = New-Object System.Collections.Generic.List[int]
+
+  try {
+    foreach ($listener in @(Get-NetTCPConnection -State Listen -LocalPort $context.GatewayPort -ErrorAction Stop)) {
+      $pid = 0
+      if ([int]::TryParse([string]$listener.OwningProcess, [ref]$pid) -and $pid -gt 0 -and -not $pids.Contains($pid)) {
+        $pids.Add($pid) | Out-Null
+      }
+    }
+  } catch {}
+
+  return @($pids)
+}
+
 function Get-OpenClawProcesses {
+  $listeningPids = @(Get-OpenClawGatewayListeningPids)
   Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
     Where-Object {
-      ($_.Name -eq "node.exe" -and $_.CommandLine -like "*openclaw*gateway*" -and $_.CommandLine -notlike "*--help*")
+      $commandLine = [string]$_.CommandLine
+      (
+        ($commandLine -like "*openclaw*gateway*" -and $commandLine -notlike "*--help*") -or
+        (($listeningPids -contains [int]$_.ProcessId) -and $commandLine -like "*openclaw*")
+      )
     }
 }
 
@@ -1398,7 +1647,8 @@ function Get-OpenClawNewestGatewayProcess {
 
 function Test-OpenClawGatewayStartupGrace {
   param(
-    [int]$GraceSeconds = 900
+    [int]$ColdStartGraceSeconds = 360,
+    [int]$ListeningGraceSeconds = 600
   )
 
   $process = @(Get-OpenClawNewestGatewayProcess | Select-Object -First 1)
@@ -1411,7 +1661,8 @@ function Test-OpenClawGatewayStartupGrace {
     return $false
   }
 
-  return (((Get-Date) - $startedAt).TotalSeconds -lt $GraceSeconds)
+  $graceSeconds = if (Test-OpenClawGatewayPortListening) { $ListeningGraceSeconds } else { $ColdStartGraceSeconds }
+  return (((Get-Date) - $startedAt).TotalSeconds -lt $graceSeconds)
 }
 
 function Clear-OpenClawStaleGatewayLocks {
@@ -1555,7 +1806,89 @@ function Get-OpenClawLatestAuditRun {
 
 function Get-OpenClawAutoStartEnabled {
   $context = Get-OpenClawContext
-  return (Test-Path $context.StartupLauncher)
+  return (Test-Path $context.AutoStartMarkerFile)
+}
+
+function Get-OpenClawAutoStartRunRegistryPath {
+  return "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+}
+
+function Get-OpenClawAutoStartRunValueName {
+  return "OpenClaw Gateway"
+}
+
+function Get-OpenClawAutoStartCommand {
+  $context = Get-OpenClawContext
+  return ('wscript.exe "{0}"' -f $context.LauncherVbs)
+}
+
+function Get-OpenClawAutoStartRunValue {
+  $path = Get-OpenClawAutoStartRunRegistryPath
+  $name = Get-OpenClawAutoStartRunValueName
+
+  try {
+    $raw = & reg.exe query $path /v $name 2>$null
+    $line = $raw | Where-Object { $_ -match ("^\s*{0}\s+REG_\w+\s+" -f [regex]::Escape($name)) } | Select-Object -First 1
+    if ($line) {
+      $value = ($line -replace ("^\s*{0}\s+REG_\w+\s+" -f [regex]::Escape($name)), '').Trim()
+      if (-not [string]::IsNullOrWhiteSpace($value)) {
+        return $value
+      }
+    }
+  } catch {}
+
+  return $null
+}
+
+function Set-OpenClawAutoStartRunValue {
+  $path = Get-OpenClawAutoStartRunRegistryPath
+  $name = Get-OpenClawAutoStartRunValueName
+  $command = Get-OpenClawAutoStartCommand
+
+  & reg.exe add $path /v $name /t REG_SZ /d $command /f | Out-Null
+
+  if ([string]::IsNullOrWhiteSpace((Get-OpenClawAutoStartRunValue))) {
+    throw "无法写入当前用户自启动注册表项。"
+  }
+}
+
+function Remove-OpenClawAutoStartRunValue {
+  $path = Get-OpenClawAutoStartRunRegistryPath
+  $name = Get-OpenClawAutoStartRunValueName
+
+  try {
+    & reg.exe delete $path /v $name /f | Out-Null
+  } catch {}
+}
+
+function Ensure-OpenClawAutoStartTask {
+  $context = Get-OpenClawContext
+  Ensure-OpenClawRuntimeFiles
+
+  $expectedAction = ('wscript.exe "{0}"' -f $context.LauncherVbs)
+  $existingAction = Get-OpenClawTaskActionText -TaskName $context.AutoStartTask
+  if (-not [string]::IsNullOrWhiteSpace($existingAction)) {
+    $normalizedExisting = $existingAction.ToLowerInvariant()
+    $normalizedExpected = $expectedAction.ToLowerInvariant()
+    if ($normalizedExisting.Contains("wscript.exe") -and $normalizedExisting.Contains($context.LauncherVbs.ToLowerInvariant())) {
+      return $true
+    }
+
+    Remove-OpenClawTask -TaskName $context.AutoStartTask
+  }
+
+  try {
+    & schtasks.exe @(
+      "/Create",
+      "/TN", $context.AutoStartTask,
+      "/TR", $expectedAction,
+      "/SC", "ONLOGON",
+      "/RL", "HIGHEST",
+      "/F"
+    ) | Out-Null
+  } catch {}
+
+  return ($null -ne (Get-OpenClawTaskState -TaskName $context.AutoStartTask))
 }
 
 function Set-OpenClawAutoStart {
@@ -1569,21 +1902,12 @@ function Set-OpenClawAutoStart {
     Ensure-OpenClawRuntimeFiles
     Assert-OpenClawGatewayTask
     Assert-OpenClawKeepaliveTask
-    $launcher = $context.LauncherVbs
-    $content = @"
-Set shell = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-launcher = "$launcher"
-
-If fso.FileExists(launcher) Then
-  shell.Run "wscript.exe """ & launcher & """", 0, False
-End If
-"@
-
-    New-Item -ItemType Directory -Path (Split-Path -Parent $context.StartupLauncher) -Force | Out-Null
-    Set-Content -Path $context.StartupLauncher -Value $content -Encoding ASCII
+    Set-Content -Path $context.AutoStartMarkerFile -Value "enabled" -Encoding ASCII
+    if (-not (Test-OpenClawDesiredRunActive)) {
+      [void](Set-OpenClawDesiredRunWindow)
+    }
   } else {
-    Remove-Item $context.StartupLauncher -Force -ErrorAction SilentlyContinue
+    Remove-Item $context.AutoStartMarkerFile -Force -ErrorAction SilentlyContinue
   }
 
   return Get-OpenClawStatus
@@ -1732,8 +2056,11 @@ function Get-OpenClawStatus {
   $recentFailure = $null
   $withinStartupGrace = $false
 
-  if (-not $paused -and -not $upgradeLocked -and $processes.Count -gt 0) {
+  if (-not $paused -and -not $upgradeLocked) {
     $portListening = Test-OpenClawGatewayPortListening
+  }
+
+  if (-not $paused -and -not $upgradeLocked -and ($processes.Count -gt 0 -or $portListening)) {
     $healthy = Test-OpenClawGatewayHealthy
   }
 
@@ -1741,7 +2068,7 @@ function Get-OpenClawStatus {
     $recentFailure = Get-OpenClawLatestFailure
   }
 
-  if ($processes.Count -gt 0 -or ($gatewayTask -and [string]$gatewayTask.State -eq "Running")) {
+  if ($processes.Count -gt 0 -or $portListening -or ($gatewayTask -and [string]$gatewayTask.State -eq "Running")) {
     $withinStartupGrace = Test-OpenClawGatewayStartupGrace
   }
 
@@ -1763,6 +2090,8 @@ function Get-OpenClawStatus {
     $mode = "Paused"
   } elseif ($healthy) {
     $mode = "Running"
+  } elseif ($portListening) {
+    $mode = "Starting"
   } elseif ($processes.Count -gt 0 -and -not $withinStartupGrace) {
     $mode = "Failed"
   } elseif ($recentFailure) {
@@ -1814,14 +2143,10 @@ function Start-OpenClawSilent {
   if (Test-Path $context.PauseFile) {
     Remove-Item $context.PauseFile -Force -ErrorAction SilentlyContinue
   }
-  Get-CimInstance Win32_Process -Filter "Name = 'wscript.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
-    Where-Object {
-      ($_.Name -eq "wscript.exe" -and $_.CommandLine -like "*run-hidden.vbs*") -or
-      ($_.Name -like "powershell*" -and ($_.CommandLine -like "*gateway-watchdog.ps1*" -or $_.CommandLine -like "*gateway-supervisor.ps1*"))
-    } |
-    ForEach-Object {
-      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+  Stop-OpenClawAuxiliaryProcesses
+  Get-OpenClawProcesses | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
 
   Write-OpenClawNpmConfig
   Ensure-OpenClawPrefixPath
@@ -1839,19 +2164,20 @@ function Start-OpenClawSilent {
 
   [void](Clear-OpenClawStaleGatewayLocks -OnlyIfUnhealthy)
   try {
-    Start-ScheduledTask -TaskName $context.GatewayTask -ErrorAction SilentlyContinue
+    Start-Process -FilePath "wscript.exe" -ArgumentList @("""$($context.LauncherVbs)""") -WindowStyle Hidden | Out-Null
   } catch {}
 
-  $deadline = (Get-Date).AddSeconds(20)
+  $deadline = (Get-Date).AddSeconds(15)
+  $status = $null
   do {
-    Start-Sleep -Seconds 1
-    $status = Get-OpenClawStatus
-    if ($status.GatewayHealthy -or $status.Mode -eq "Failed") {
-      return $status
+    Start-Sleep -Milliseconds 750
+    $processes = @(Get-OpenClawProcesses)
+    if ($processes.Count -gt 0) {
+      break
     }
   } while ((Get-Date) -lt $deadline)
 
-  return $status
+  return Get-OpenClawStatus
 }
 
 function Stop-OpenClawSilent {
@@ -1870,14 +2196,7 @@ function Stop-OpenClawSilent {
   Get-OpenClawProcesses | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
   }
-  Get-CimInstance Win32_Process -Filter "Name = 'wscript.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
-    Where-Object {
-      ($_.Name -eq "wscript.exe" -and $_.CommandLine -like "*run-hidden.vbs*") -or
-      ($_.Name -like "powershell*" -and ($_.CommandLine -like "*gateway-watchdog.ps1*" -or $_.CommandLine -like "*gateway-supervisor.ps1*"))
-    } |
-    ForEach-Object {
-      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+  Stop-OpenClawAuxiliaryProcesses
 
   [void](Clear-OpenClawStaleGatewayLocks)
   Start-Sleep -Seconds 1
