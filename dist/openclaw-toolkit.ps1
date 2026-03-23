@@ -26,6 +26,63 @@ function Get-OpenClawConfigPath {
   return (Join-Path (Join-Path (Get-OpenClawUserHome) ".openclaw") "openclaw.json")
 }
 
+function Get-OpenClawRootConfigPath {
+  return (Join-Path (Get-OpenClawUserHome) ".openclaw.json")
+}
+
+function Test-OpenClawJsonConfigValid {
+  param(
+    [string]$Path
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) {
+    return $false
+  }
+
+  try {
+    $raw = Get-Content -Path $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) {
+      $raw = $raw.Substring(1)
+    }
+
+    $null = $raw | ConvertFrom-Json -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Repair-OpenClawConfigMirror {
+  $runtimePath = Get-OpenClawConfigPath
+  $rootPath = Get-OpenClawRootConfigPath
+  $runtimeValid = Test-OpenClawJsonConfigValid -Path $runtimePath
+  $rootValid = Test-OpenClawJsonConfigValid -Path $rootPath
+
+  try {
+    if (-not $runtimeValid -and $rootValid) {
+      Copy-Item -Path $rootPath -Destination $runtimePath -Force
+      return
+    }
+
+    if ($runtimeValid -and -not $rootValid) {
+      Copy-Item -Path $runtimePath -Destination $rootPath -Force
+      return
+    }
+
+    if (-not $runtimeValid -or -not $rootValid) {
+      return
+    }
+
+    $runtimeItem = Get-Item -Path $runtimePath -ErrorAction Stop
+    $rootItem = Get-Item -Path $rootPath -ErrorAction Stop
+    if ($runtimeItem.LastWriteTimeUtc -gt $rootItem.LastWriteTimeUtc) {
+      Copy-Item -Path $runtimePath -Destination $rootPath -Force
+    } elseif ($rootItem.LastWriteTimeUtc -gt $runtimeItem.LastWriteTimeUtc) {
+      Copy-Item -Path $rootPath -Destination $runtimePath -Force
+    }
+  } catch {}
+}
+
 function Get-OpenClawConfiguredGatewayPort {
   $defaultPort = 18789
 
@@ -37,6 +94,7 @@ function Get-OpenClawConfiguredGatewayPort {
     }
   }
 
+  Repair-OpenClawConfigMirror
   $configPath = Get-OpenClawConfigPath
   if (Test-Path $configPath) {
     try {
@@ -157,6 +215,7 @@ function Get-OpenClawContext {
     UserHome = $userHome
     Home = $openClawHome
     PauseFile = Join-Path $openClawHome ".paused"
+    RestartSentinelFile = Join-Path $openClawHome "restart-sentinel.json"
     AutoStartMarkerFile = Join-Path $openClawHome ".autostart-enabled"
     DesiredRunMarkerFile = Join-Path $openClawHome ".desired-running"
     DesiredRunUntilFile = Join-Path $openClawHome ".desired-running-until"
@@ -308,6 +367,74 @@ function Clear-OpenClawDesiredRunWindow {
   Remove-Item $context.DesiredRunUntilFile -Force -ErrorAction SilentlyContinue
 }
 
+function Get-OpenClawRestartSentinel {
+  $context = Get-OpenClawContext
+  if (-not (Test-Path $context.RestartSentinelFile)) {
+    return $null
+  }
+
+  try {
+    return (Get-Content $context.RestartSentinelFile -Raw -ErrorAction Stop | ConvertFrom-Json)
+  } catch {
+    return $null
+  }
+}
+
+function Test-OpenClawPendingRestart {
+  $context = Get-OpenClawContext
+  if (-not (Test-Path $context.RestartSentinelFile)) {
+    return $false
+  }
+
+  try {
+    $item = Get-Item $context.RestartSentinelFile -ErrorAction Stop
+    if ($item.LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
+      return $false
+    }
+  } catch {
+    return $false
+  }
+
+  $sentinel = Get-OpenClawRestartSentinel
+  if ($null -eq $sentinel) {
+    return $true
+  }
+
+  $kind = [string]$sentinel.payload.kind
+  $status = [string]$sentinel.payload.status
+  if ([string]::IsNullOrWhiteSpace($kind)) {
+    return $true
+  }
+
+  return (($kind -eq "restart" -or $kind -eq "gateway.restart") -and ([string]::IsNullOrWhiteSpace($status) -or $status -eq "ok"))
+}
+
+function Clear-OpenClawRestartSentinel {
+  $context = Get-OpenClawContext
+  Remove-Item $context.RestartSentinelFile -Force -ErrorAction SilentlyContinue
+}
+
+function Resolve-OpenClawPendingRestart {
+  $context = Get-OpenClawContext
+  if (-not (Test-Path $context.PauseFile)) {
+    return $false
+  }
+
+  if (-not (Test-OpenClawPendingRestart)) {
+    return $false
+  }
+
+  $shouldResume = (Test-Path $context.AutoStartMarkerFile) -or (Test-Path $context.DesiredRunMarkerFile) -or ($null -ne (Get-OpenClawDesiredRunDeadline))
+  if (-not $shouldResume) {
+    return $false
+  }
+
+  Remove-Item $context.PauseFile -Force -ErrorAction SilentlyContinue
+  Clear-OpenClawRestartSentinel
+  [void](Set-OpenClawDesiredRunWindow)
+  return $true
+}
+
 function Get-OpenClawDesiredRunDeadline {
   $context = Get-OpenClawContext
   if (-not (Test-Path $context.DesiredRunUntilFile)) {
@@ -360,6 +487,7 @@ Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 baseDir = fso.GetParentFolderName(WScript.ScriptFullName)
 pauseFile = fso.BuildPath(baseDir, ".paused")
+restartSentinelFile = fso.BuildPath(baseDir, "restart-sentinel.json")
 desiredRunMarkerFile = fso.BuildPath(baseDir, ".desired-running")
 desiredRunFile = fso.BuildPath(baseDir, ".desired-running-until")
 upgradeLockFile = fso.BuildPath(baseDir, ".upgrade-lock")
@@ -374,7 +502,19 @@ Function ToIsoLocal(dt)
 End Function
 
 If fso.FileExists(pauseFile) Then
-  WScript.Quit 0
+  If fso.FileExists(restartSentinelFile) Then
+    On Error Resume Next
+    ageMinutes = DateDiff("n", fso.GetFile(restartSentinelFile).DateLastModified, Now)
+    If Err.Number = 0 And ageMinutes <= 30 Then
+      fso.DeleteFile pauseFile, True
+      fso.DeleteFile restartSentinelFile, True
+    Else
+      WScript.Quit 0
+    End If
+    On Error GoTo 0
+  Else
+    WScript.Quit 0
+  End If
 End If
 If fso.FileExists(upgradeLockFile) Then
   WScript.Quit 0
@@ -463,20 +603,60 @@ set "no_proxy=$noProxy"
 }
 
 function Get-OpenClawGatewayWatchdogContent {
+  $context = Get-OpenClawContext
   $port = Get-OpenClawConfiguredGatewayPort
+  $nodeExe = Get-OpenClawNodeExePath
+  $entry = Get-OpenClawEntryPath
+  $noProxy = Get-OpenClawNoProxyValue
+  if ([string]::IsNullOrWhiteSpace($entry)) {
+    $entry = Join-Path (Get-OpenClawDefaultPrefix) "node_modules\openclaw\openclaw.mjs"
+  }
   $content = @'
 $ErrorActionPreference = "Stop"
 
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $baseDir
 $pauseFile = Join-Path $baseDir ".paused"
+$restartSentinelFile = Join-Path $baseDir "restart-sentinel.json"
 $autoStartMarkerFile = Join-Path $baseDir ".autostart-enabled"
 $desiredRunMarkerFile = Join-Path $baseDir ".desired-running"
 $desiredRunUntilFile = Join-Path $baseDir ".desired-running-until"
 $upgradeLockFile = Join-Path $baseDir ".upgrade-lock"
 
+function Test-RestartResumePending {
+  if (-not (Test-Path $restartSentinelFile)) {
+    return $false
+  }
+
+  try {
+    $item = Get-Item $restartSentinelFile -ErrorAction Stop
+    if ($item.LastWriteTime -lt (Get-Date).AddMinutes(-30)) {
+      return $false
+    }
+  } catch {
+    return $false
+  }
+
+  try {
+    $sentinel = Get-Content $restartSentinelFile -Raw -ErrorAction Stop | ConvertFrom-Json
+    $kind = [string]$sentinel.payload.kind
+    $status = [string]$sentinel.payload.status
+    if ([string]::IsNullOrWhiteSpace($kind)) {
+      return $true
+    }
+    return (($kind -eq "restart" -or $kind -eq "gateway.restart") -and ([string]::IsNullOrWhiteSpace($status) -or $status -eq "ok"))
+  } catch {
+    return $true
+  }
+}
+
 if (Test-Path $pauseFile) {
-  exit 0
+  if (Test-RestartResumePending) {
+    Remove-Item $pauseFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $restartSentinelFile -Force -ErrorAction SilentlyContinue
+  } else {
+    exit 0
+  }
 }
 
 if (Test-Path $upgradeLockFile) {
@@ -490,6 +670,10 @@ $gatewayTask = "OpenClaw Gateway"
 $coldStartGraceSeconds = 360
 $listeningGraceSeconds = 600
 $port = __OPENCLAW_PORT__
+$nodeExe = '__OPENCLAW_NODE_EXE__'
+$entry = '__OPENCLAW_ENTRY__'
+$userHome = '__OPENCLAW_USER_HOME__'
+$noProxy = '__OPENCLAW_NO_PROXY__'
 $healthzUrl = "http://127.0.0.1:$port/healthz"
 
 if (-not (Test-Path $logDir)) {
@@ -661,6 +845,33 @@ function Stop-GatewayProcesses {
   }
 }
 
+function Start-GatewayDirect {
+  try {
+    $env:HOME = $userHome
+    $env:TMPDIR = $env:TEMP
+    $env:OPENCLAW_STATE_DIR = $baseDir
+    $env:OPENCLAW_CONFIG_PATH = (Join-Path $baseDir 'openclaw.json')
+    $env:OPENCLAW_GATEWAY_PORT = [string]$port
+    $env:OPENCLAW_WINDOWS_TASK_NAME = $gatewayTask
+    $env:OPENCLAW_SERVICE_MARKER = 'openclaw'
+    $env:OPENCLAW_SERVICE_KIND = 'gateway'
+    $env:NO_PROXY = $noProxy
+    $env:no_proxy = $noProxy
+
+    $proc = Start-Process -FilePath $nodeExe `
+      -ArgumentList @('--disable-warning=ExperimentalWarning', $entry, 'gateway', '--port', [string]$port, '--force') `
+      -WorkingDirectory $baseDir `
+      -WindowStyle Hidden `
+      -PassThru `
+      -ErrorAction Stop
+    Write-Log "started gateway directly pid=$($proc.Id)"
+    return $true
+  } catch {
+    Write-Log "direct gateway start failed: $($_.Exception.Message)"
+    return $false
+  }
+}
+
 function Test-WithinStartupGrace {
   param([System.Object]$ProcessInfo)
 
@@ -809,7 +1020,7 @@ try {
   }
 
   Clear-StaleGatewayLocks -GatewayProcesses @(Get-GatewayProcesses)
-  [void](Start-GatewayTask)
+  [void](Start-GatewayDirect)
 }
 finally {
   if ($hasMutex) {
@@ -818,7 +1029,12 @@ finally {
   $mutex.Dispose()
 }
 '@
-  return ($content -replace '__OPENCLAW_PORT__', [string]$port)
+  $content = $content -replace '__OPENCLAW_PORT__', [string]$port
+  $content = $content -replace '__OPENCLAW_NODE_EXE__', $nodeExe
+  $content = $content -replace '__OPENCLAW_ENTRY__', $entry
+  $content = $content -replace '__OPENCLAW_USER_HOME__', $context.UserHome
+  $content = $content -replace '__OPENCLAW_NO_PROXY__', $noProxy
+  return $content
 }
 
 function Get-OpenClawGatewaySupervisorContent {
@@ -841,7 +1057,7 @@ function Set-OpenClawToolsFullAccess {
     throw "OpenClaw config not found: $ConfigPath"
   }
 
-  $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json -Depth 100
+  $config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 
   if (-not $config.tools) {
     $config | Add-Member -NotePropertyName tools -NotePropertyValue ([pscustomobject]@{})
@@ -1086,6 +1302,7 @@ function Ensure-OpenClawRuntimeFiles {
   New-Item -ItemType Directory -Path $context.Home -Force | Out-Null
   New-Item -ItemType Directory -Path $context.TempLogDir -Force | Out-Null
   New-Item -ItemType Directory -Path $context.BackupRoot -Force | Out-Null
+  Repair-OpenClawConfigMirror
 
   Write-OpenClawTextFile -Path $context.LauncherVbs -Content (Get-OpenClawRunHiddenVbsContent) -Encoding "ASCII"
   Write-OpenClawTextFile -Path $context.WatchdogLauncherVbs -Content (Get-OpenClawWatchdogLauncherVbsContent) -Encoding "ASCII"
@@ -2033,6 +2250,7 @@ function Get-OpenClawStatus {
   )
 
   $context = Get-OpenClawContext
+  [void](Resolve-OpenClawPendingRestart)
   $latestAudit = Get-OpenClawLatestAuditRun
   $keepaliveTask = $null
   $gatewayTask = $null
@@ -2143,6 +2361,7 @@ function Start-OpenClawSilent {
   if (Test-Path $context.PauseFile) {
     Remove-Item $context.PauseFile -Force -ErrorAction SilentlyContinue
   }
+  Clear-OpenClawRestartSentinel
   Stop-OpenClawAuxiliaryProcesses
   Get-OpenClawProcesses | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -2164,7 +2383,26 @@ function Start-OpenClawSilent {
 
   [void](Clear-OpenClawStaleGatewayLocks -OnlyIfUnhealthy)
   try {
-    Start-Process -FilePath "wscript.exe" -ArgumentList @("""$($context.LauncherVbs)""") -WindowStyle Hidden | Out-Null
+    $env:HOME = $context.UserHome
+    $env:TMPDIR = $env:TEMP
+    $env:OPENCLAW_STATE_DIR = $context.Home
+    $env:OPENCLAW_CONFIG_PATH = (Join-Path $context.Home 'openclaw.json')
+    $env:OPENCLAW_GATEWAY_PORT = [string]$context.GatewayPort
+    $env:OPENCLAW_WINDOWS_TASK_NAME = $context.GatewayTask
+    $env:OPENCLAW_SERVICE_MARKER = 'openclaw'
+    $env:OPENCLAW_SERVICE_KIND = 'gateway'
+    $env:NO_PROXY = Get-OpenClawNoProxyValue
+    $env:no_proxy = $env:NO_PROXY
+
+    $entry = Get-OpenClawEntryPath
+    if ([string]::IsNullOrWhiteSpace($entry)) {
+      $entry = Join-Path (Get-OpenClawDefaultPrefix) 'node_modules\openclaw\openclaw.mjs'
+    }
+
+    Start-Process -FilePath (Get-OpenClawNodeExePath) `
+      -ArgumentList @('--disable-warning=ExperimentalWarning', $entry, 'gateway', '--port', [string]$context.GatewayPort, '--force') `
+      -WorkingDirectory $context.Home `
+      -WindowStyle Hidden | Out-Null
   } catch {}
 
   $deadline = (Get-Date).AddSeconds(15)
@@ -2184,6 +2422,7 @@ function Stop-OpenClawSilent {
   $context = Get-OpenClawContext
   New-Item -ItemType Directory -Path $context.Home -Force | Out-Null
   Set-Content -Path $context.PauseFile -Value ("paused at {0}" -f (Get-Date -Format "s")) -Encoding ASCII
+  Clear-OpenClawRestartSentinel
   Clear-OpenClawDesiredRunWindow
 
   try {

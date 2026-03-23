@@ -684,7 +684,16 @@ $script:IsRefreshRunning = $false
 $script:RefreshQueued = $false
 $script:RefreshQueuedIncludeLatest = $false
 $script:ActiveActionCount = 0
-$script:ToolkitPathLiteral = $toolkitPath.Replace("'", "''")
+$script:ToolkitBootstrapLiteral = if (-not [string]::IsNullOrWhiteSpace($embeddedToolkitBase64) -and $embeddedToolkitBase64 -ne "__EMBEDDED_TOOLKIT_BASE64__") {
+@"
+`$toolkitContent = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$embeddedToolkitBase64'))
+`$script:OpenClawToolkitSelfPath = `$null
+`$script:OpenClawToolkitSelfContent = `$toolkitContent
+. ([scriptblock]::Create(`$toolkitContent))
+"@
+} else {
+  ". '$($toolkitPath.Replace("'", "''"))'"
+}
 
 function Convert-ModeText {
   param([string]$Mode)
@@ -892,7 +901,7 @@ function Start-PanelAsyncOperation {
   $scriptText = @"
 param(`$Payload)
 `$ErrorActionPreference = 'Stop'
-. '$($script:ToolkitPathLiteral)'
+$($script:ToolkitBootstrapLiteral)
 $Body
 "@
 
